@@ -2,9 +2,10 @@
 import os
 from datetime import datetime
 from typing import Dict, List, Optional
-
+from influxdb_client import Point # Importar la clase Point
+from ..models.ingest import IngestData # Importar el nuevo modelo
 # Importar cliente y configuración
-from ..core.db_client import get_query_api
+from ..core.db_client import get_query_api, get_write_api_async
 from ..core.config import settings
 from ..core.enums import SeverityLevel
 
@@ -354,3 +355,55 @@ async def get_historical_physical_data(
     except Exception as e:
         print(f"ERROR: Unexpected error in get_historical_physical_data for '{installation_id}': {e}")
         return None
+
+
+# --- Nueva Función de Escritura ---
+
+async def write_sensor_data(installation_id: str, data: IngestData) -> bool:
+    """
+    Escribe un punto de datos de sensor en InfluxDB.
+    Devuelve True si tiene éxito, False en caso contrario.
+    """
+    try:
+        write_api = await get_write_api_async()
+
+        # Crear el objeto Point de InfluxDB
+        point = Point(data.measurement)
+        point.tag("installation_id", installation_id) # Tag obligatorio
+
+        # Añadir tags opcionales
+        if data.tags:
+            for key, value in data.tags.items():
+                point.tag(key, value)
+
+        # Añadir fields
+        if not data.fields:
+             print(f"WARN: Skipping write for {installation_id} - {data.measurement}: No fields provided.")
+             return False # O quizás True si no es un error fatal
+
+        for key, value in data.fields.items():
+             # Intentar convertir a float si es posible, si no, mantener el tipo original
+             # InfluxDB maneja int, float, bool, str
+             try:
+                 processed_value = float(value)
+             except (ValueError, TypeError):
+                 processed_value = value # Mantener como string, bool, etc.
+             point.field(key, processed_value)
+
+
+        # Añadir timestamp (asegúrate de que sea timezone-aware, preferiblemente UTC)
+        # Pydantic v2 maneja esto bien si el string de entrada tiene formato ISO con offset
+        point.time(data.timestamp)
+
+        # Escribir el punto de forma asíncrona
+        # print(f"DEBUG: Writing point: {point.to_line_protocol()}") # Descomentar para depurar
+        await write_api.write(bucket=settings.INFLUXDB_BUCKET, org=settings.INFLUXDB_ORG, record=point)
+        # print(f"DEBUG: Point written successfully for {installation_id} - {data.measurement}")
+        return True
+
+    except Exception as e:
+        print(f"ERROR: Failed to write data to InfluxDB for '{installation_id}': {e}")
+        # Considera loggear el traceback completo
+        # import traceback
+        # traceback.print_exc()
+        return False

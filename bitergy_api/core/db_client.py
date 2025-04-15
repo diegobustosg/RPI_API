@@ -22,6 +22,14 @@ async def get_query_api():
     client = get_influxdb_client()
     return client.query_api()
 
+# Esta función ahora simplemente obtiene el cliente y llama a su método .write_api()
+async def get_write_api_async(): # No necesita especificar el tipo de retorno aquí necesariamente
+    """Obtiene la API de escritura asíncrona del cliente InfluxDB."""
+    client = get_influxdb_client()
+    # El método .write_api() del cliente asíncrono devuelve el objeto correcto
+    return client.write_api()
+
+
 async def close_influxdb_client():
     """Cierra la conexión del cliente InfluxDB si existe."""
     global _async_influx_client

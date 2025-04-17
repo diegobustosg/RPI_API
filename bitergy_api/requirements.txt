@@ -6,4 +6,5 @@ pydantic-settings==2.1.0
 influxdb-client==1.40.0
 python-dotenv==1.0.1
 aiohttp==3.9.1 # O la última versión estable
+aiocsv==1.2.4 # O la última versión establ
 # watchfiles==0.21.0 # Descomentar para desarrollo con --reload

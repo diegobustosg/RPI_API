@@ -1,8 +1,9 @@
 # services/data_provider.py
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from influxdb_client import Point # Importar la clase Point
+from influxdb_client.client.exceptions import InfluxDBError
 from ..models.ingest import IngestData # Importar el nuevo modelo
 # Importar cliente y configuración
 from ..core.db_client import get_query_api, get_write_api_async
@@ -28,6 +29,10 @@ from ..models.physical import (
     PhysicalVariableValue,
     GroupedHistoricalPhysicalData # <-- Importar desde aquí
 )
+
+# Importar clase para escribir datos
+from ..models.ingest import IngestData
+
 
 # --- Funciones de ayuda (get_unit_for_measurement, _get_thresholds_for_installation, _calculate_severity) ---
 # (Estas funciones permanecen igual que en la respuesta anterior)
@@ -239,30 +244,40 @@ async def get_realtime_physical_data(installation_id: str) -> Optional[RealtimeP
         print(f"ERROR: Unexpected error in get_realtime_physical_data for '{installation_id}': {e}")
         return None
 
-# --- Funciones Históricas (Sin cambios significativos respecto a la versión anterior, solo corrección de import) ---
 async def get_historical_electrical_data(
     installation_id: str, start: datetime, end: datetime
 ) -> Optional[GroupedHistoricalElectricalData]:
-    """Obtiene datos históricos eléctricos."""
+    """Obtiene datos históricos eléctricos insertando fechas formateadas directamente."""
     try:
         query_api = await get_query_api()
-        start_str = start.isoformat(timespec='microseconds') + "Z"
-        end_str = end.isoformat(timespec='microseconds') + "Z"
         measurements = ["voltage", "current", "active_power", "energy", "frequency", "power_factor"]
 
+        # Asegurar que los datetimes son timezone-aware (UTC) para formato correcto
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+
+        # Formatear fechas a RFC3339 con 'Z'
+        start_str = start.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        end_str = end.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+        # Construir la query insertando los strings de fecha directamente
         flux_query = f'''
         from(bucket: "{settings.INFLUXDB_BUCKET}")
-          |> range(start: {start_str}, stop: {end_str})
-          |> filter(fn: (r) => r["_measurement"] == "{'" or r["_measurement"] == "'.join(measurements)}")
-          |> filter(fn: (r) => r["installation_id"] == "{installation_id}")
-          // Opcional: Agregación si el rango es muy grande
-          // |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
+          |> range(start: {start_str}, stop: {end_str}) // <-- Insertar strings formateados
+          |> filter(fn: (r) => contains(value: r._measurement, set: {measurements})) // Insertar lista
+          |> filter(fn: (r) => r["installation_id"] == "{installation_id}") // Insertar string
           |> yield(name: "results")
         '''
-        # print(f"DEBUG: Historical Electrical Query:\n{flux_query}")
+        # print(f"DEBUG: Historical Electrical Query (Direct Timestamp):\n{flux_query}")
+
+        # No se pasan 'params' para las fechas
         result = await query_api.query(query=flux_query, org=settings.INFLUXDB_ORG)
 
-        if not result: return None
+        if not result:
+            print(f"WARN: No historical electrical data found for '{installation_id}' in range.")
+            return None
 
         grouped_data: Dict[str, List[HistoricalDataPoint]] = {}
         for table in result:
@@ -273,88 +288,182 @@ async def get_historical_electrical_data(
                     value = record.get_value()
                     time = record.get_time()
                     unit = get_unit_for_measurement(measurement, field)
-                    # Crear nombre de variable (p.ej., "Voltage Phase A")
                     variable_name = f"{measurement.replace('_', ' ').title()} {field.replace('_', ' ').title()}"
-                    # Corregir para variables sin 'phase'
                     if measurement in ["frequency", "energy"]:
-                        variable_name = f"{measurement.replace('_', ' ').title()}"
-                    # Asegurar que la clave existe antes de añadir
+                         variable_name = f"{measurement.replace('_', ' ').title()}"
                     if variable_name not in grouped_data:
                         grouped_data[variable_name] = []
-                    grouped_data[variable_name].append(
-                        HistoricalDataPoint(timestamp=time, value=value, unit=unit)
-                    )
-                except (KeyError, TypeError, AttributeError, ValueError) as e: # Captura más errores posibles
+                    grouped_data[variable_name].append(HistoricalDataPoint(timestamp=time, value=value, unit=unit))
+                except (KeyError, TypeError, AttributeError, ValueError) as e:
                     print(f"WARN: Skipping record due to parsing error in historical electrical: {e} - Record: {record.values if record else 'None'}")
                     continue
 
-        if not grouped_data: return None
+        if not grouped_data:
+            print(f"WARN: Processed historical electrical data is empty for '{installation_id}'.")
+            return None
 
         return GroupedHistoricalElectricalData(
             asset_id=installation_id, start_time=start, end_time=end, data=grouped_data
         )
+
+    except InfluxDBError as e:
+        print(f"ERROR: InfluxDB query error (electrical historical) for '{installation_id}': {e}")
+        if e.response is not None and hasattr(e.response, 'data'):
+             try: error_body = e.response.data.decode('utf-8'); print(f"InfluxDB Response Body: {error_body}")
+             except Exception: print(f"InfluxDB Response Body (raw bytes): {e.response.data}")
+        return None
     except Exception as e:
         print(f"ERROR: Unexpected error in get_historical_electrical_data for '{installation_id}': {e}")
         return None
 
+    
+    
 async def get_historical_physical_data(
     installation_id: str, start: datetime, end: datetime
 ) -> Optional[GroupedHistoricalPhysicalData]:
-    """Obtiene datos históricos físicos."""
+    """Obtiene datos históricos físicos insertando fechas formateadas directamente."""
     try:
         query_api = await get_query_api()
-        start_str = start.isoformat(timespec='microseconds') + "Z"
-        end_str = end.isoformat(timespec='microseconds') + "Z"
-        measurements = ["temperature", "humidity", "level"] # Ajusta a tus measurements
+        measurements = ["temperature", "humidity", "level"]
 
+        # Formatear fechas a RFC3339 con 'Z'
+        start_str = start.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        end_str = end.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+
+        # Construir la query insertando todo directamente
         flux_query = f'''
         from(bucket: "{settings.INFLUXDB_BUCKET}")
-          |> range(start: {start_str}, stop: {end_str})
-          |> filter(fn: (r) => r["_measurement"] == "{'" or r["_measurement"] == "'.join(measurements)}")
-          |> filter(fn: (r) => r["installation_id"] == "{installation_id}")
-          // |> aggregateWindow(every: 1m, fn: mean, createEmpty: false) // Opcional
+          |> range(start: {start_str}, stop: {end_str}) // <-- Insertar strings formateados
+          |> filter(fn: (r) => contains(value: r._measurement, set: {measurements})) // Insertar lista
+          |> filter(fn: (r) => r["installation_id"] == "{installation_id}") // Insertar string
           |> yield(name: "results")
         '''
-        # print(f"DEBUG: Historical Physical Query:\n{flux_query}")
+        # print(f"DEBUG: Historical Physical Query (Direct Timestamp):\n{flux_query}")
+
+        # Ya no pasamos 'params'
         result = await query_api.query(query=flux_query, org=settings.INFLUXDB_ORG)
 
+        # ... (resto del procesamiento de 'result' como antes) ...
         if not result: return None
-
         grouped_data: Dict[str, List[HistoricalDataPoint]] = {}
         for table in result:
             for record in table.records:
                 try:
-                    measurement = record.get_measurement()
-                    field = record.get_field()
-                    value = record.get_value()
-                    time = record.get_time()
-                    unit = get_unit_for_measurement(measurement, field)
-                    # Crear nombre de variable, considerando el 'field' si es relevante
+                    measurement = record.get_measurement(); field = record.get_field(); value = record.get_value(); time = record.get_time(); unit = get_unit_for_measurement(measurement, field)
                     variable_name = f"{measurement.replace('_', ' ').title()}"
-                    # Añadir nombre del campo si no es el genérico 'value' y hay datos
-                    if field != 'value' and value is not None:
-                         variable_name += f" {field.replace('_', ' ').title()}"
-                         # Opcional: Añadir tag de localización si existe
-                         # location = record.values.get("location")
-                         # if location: variable_name += f" ({location})"
-
-                    if variable_name not in grouped_data:
-                        grouped_data[variable_name] = []
-                    grouped_data[variable_name].append(
-                        HistoricalDataPoint(timestamp=time, value=value, unit=unit)
-                    )
+                    if field != 'value' and value is not None: variable_name += f" {field.replace('_', ' ').title()}"
+                    if variable_name not in grouped_data: grouped_data[variable_name] = []
+                    grouped_data[variable_name].append(HistoricalDataPoint(timestamp=time, value=value, unit=unit))
                 except (KeyError, TypeError, AttributeError, ValueError) as e:
                     print(f"WARN: Skipping record due to parsing error in historical physical: {e} - Record: {record.values if record else 'None'}")
                     continue
-
         if not grouped_data: return None
+        return GroupedHistoricalPhysicalData(asset_id=installation_id, start_time=start, end_time=end, data=grouped_data)
 
-        return GroupedHistoricalPhysicalData(
-            asset_id=installation_id, start_time=start, end_time=end, data=grouped_data
-        )
+    except InfluxDBError as e:
+        print(f"ERROR: InfluxDB query error (physical historical) for '{installation_id}': {e}")
+        if e.response is not None and hasattr(e.response, 'data'):
+             try: error_body = e.response.data.decode('utf-8'); print(f"InfluxDB Response Body: {error_body}")
+             except Exception: print(f"InfluxDB Response Body (raw bytes): {e.response.data}")
+        return None
     except Exception as e:
         print(f"ERROR: Unexpected error in get_historical_physical_data for '{installation_id}': {e}")
         return None
+    
+async def get_historical_electrical_data(
+    installation_id: str, start: datetime, end: datetime
+) -> Optional[GroupedHistoricalElectricalData]:
+    """Obtiene datos históricos eléctricos formateando la lista de measurements para Flux."""
+    try:
+        query_api = await get_query_api()
+        measurements = ["voltage", "current", "active_power", "energy", "frequency", "power_factor"]
+
+        # --- Formateo Correcto ---
+        start_str = start.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        end_str = end.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        # Convertir lista de Python a string de array Flux ["item1", "item2"]
+        measurements_flux_array = '[' + ', '.join(f'"{m}"' for m in measurements) + ']'
+        # --------------------------
+
+        flux_query = f'''
+        from(bucket: "{settings.INFLUXDB_BUCKET}")
+          |> range(start: {start_str}, stop: {end_str})
+          |> filter(fn: (r) => contains(value: r._measurement, set: {measurements_flux_array})) // <-- Usar string formateado
+          |> filter(fn: (r) => r["installation_id"] == "{installation_id}")
+          |> yield(name: "results")
+        '''
+        # print(f"DEBUG: Historical Electrical Query (Formatted List):\n{flux_query}")
+
+        result = await query_api.query(query=flux_query, org=settings.INFLUXDB_ORG)
+
+        # ... (resto del procesamiento de 'result' sin cambios) ...
+        if not result: return None
+        grouped_data: Dict[str, List[HistoricalDataPoint]] = {}
+        for table in result:
+             for record in table.records:
+                 # ... (procesamiento del record) ...
+                 try:
+                     measurement = record.get_measurement(); field = record.get_field(); value = record.get_value(); time = record.get_time(); unit = get_unit_for_measurement(measurement, field)
+                     variable_name = f"{measurement.replace('_', ' ').title()} {field.replace('_', ' ').title()}"
+                     if measurement in ["frequency", "energy"]: variable_name = f"{measurement.replace('_', ' ').title()}"
+                     if variable_name not in grouped_data: grouped_data[variable_name] = []
+                     grouped_data[variable_name].append(HistoricalDataPoint(timestamp=time, value=value, unit=unit))
+                 except (KeyError, TypeError, AttributeError, ValueError) as e: print(f"WARN: Skipping record due to parsing error in historical electrical: {e} - Record: {record.values if record else 'None'}"); continue
+        if not grouped_data: return None
+        return GroupedHistoricalElectricalData(asset_id=installation_id, start_time=start, end_time=end, data=grouped_data)
+
+
+    # ... (Manejo de errores sin cambios) ...
+    except InfluxDBError as e: print(f"ERROR: InfluxDB query error (electrical historical) for '{installation_id}': {e}"); ...; return None
+    except Exception as e: print(f"ERROR: Unexpected error in get_historical_electrical_data for '{installation_id}': {e}"); return None
+   
+
+async def get_historical_physical_data(
+    installation_id: str, start: datetime, end: datetime
+) -> Optional[GroupedHistoricalPhysicalData]:
+    """Obtiene datos históricos físicos formateando la lista de measurements para Flux."""
+    try:
+        query_api = await get_query_api()
+        measurements = ["temperature", "humidity", "level"]
+
+        # --- Formateo Correcto ---
+        start_str = start.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        end_str = end.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        # Convertir lista de Python a string de array Flux ["item1", "item2"]
+        measurements_flux_array = '[' + ', '.join(f'"{m}"' for m in measurements) + ']'
+        # --------------------------
+
+        flux_query = f'''
+        from(bucket: "{settings.INFLUXDB_BUCKET}")
+          |> range(start: {start_str}, stop: {end_str})
+          |> filter(fn: (r) => contains(value: r._measurement, set: {measurements_flux_array})) // <-- Usar string formateado
+          |> filter(fn: (r) => r["installation_id"] == "{installation_id}")
+          |> yield(name: "results")
+        '''
+        print(f"DEBUG: Historical Physical Query (Formatted List):\n{flux_query}")
+
+        result = await query_api.query(query=flux_query, org=settings.INFLUXDB_ORG)
+
+        # ... (resto del procesamiento de 'result' sin cambios) ...
+        if not result: return None
+        grouped_data: Dict[str, List[HistoricalDataPoint]] = {}
+        # ... (Bucle for para procesar records) ...
+        for table in result:
+             for record in table.records:
+                  # ... (procesamiento del record) ...
+                  try:
+                      measurement = record.get_measurement(); field = record.get_field(); value = record.get_value(); time = record.get_time(); unit = get_unit_for_measurement(measurement, field)
+                      variable_name = f"{measurement.replace('_', ' ').title()}"
+                      if field != 'value' and value is not None: variable_name += f" {field.replace('_', ' ').title()}"
+                      if variable_name not in grouped_data: grouped_data[variable_name] = []
+                      grouped_data[variable_name].append(HistoricalDataPoint(timestamp=time, value=value, unit=unit))
+                  except (KeyError, TypeError, AttributeError, ValueError) as e: print(f"WARN: Skipping record due to parsing error in historical physical: {e} - Record: {record.values if record else 'None'}"); continue
+        if not grouped_data: return None
+        return GroupedHistoricalPhysicalData(asset_id=installation_id, start_time=start, end_time=end, data=grouped_data)
+
+    # ... (Manejo de errores sin cambios) ...
+    except InfluxDBError as e: print(f"ERROR: InfluxDB query error (physical historical) for '{installation_id}': {e}"); ...; return None
+    except Exception as e: print(f"ERROR: Unexpected error in get_historical_physical_data for '{installation_id}': {e}"); return None
 
 
 # --- Nueva Función de Escritura ---
@@ -396,7 +505,7 @@ async def write_sensor_data(installation_id: str, data: IngestData) -> bool:
         point.time(data.timestamp)
 
         # Escribir el punto de forma asíncrona
-        # print(f"DEBUG: Writing point: {point.to_line_protocol()}") # Descomentar para depurar
+        print(f"DEBUG: Writing point: {point.to_line_protocol()}") # Descomentar para depurar
         await write_api.write(bucket=settings.INFLUXDB_BUCKET, org=settings.INFLUXDB_ORG, record=point)
         # print(f"DEBUG: Point written successfully for {installation_id} - {data.measurement}")
         return True
